@@ -5,27 +5,19 @@ import sqlite3
 import hashlib
 import feedparser
 import aiohttp
+import re
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    ContextTypes, JobQueue
+    ContextTypes
 )
 
 # ==================== CONFIG ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8155847480:AAFsC7nlccy-kCEmvn3L_IIQW13YKOHSVrw")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID", "-1003632128683"))
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@Roboallbotchannel")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "6593860853"))
-
-# Official Government Sources
-SOURCES = {
-    'employment_news': 'https://employmentnews.gov.in/rss-feed',
-    'ssc': 'https://ssc.nic.in/rss-feed',
-    'upsc': 'https://upsc.gov.in/rss-feed',
-    'tnpsc': 'https://tnpsc.gov.in/rss-feed',
-    'uppsc': 'https://uppsc.up.nic.in/rss'
-}
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -43,7 +35,6 @@ class Database:
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         
-        # Jobs table
         c.execute('''
             CREATE TABLE IF NOT EXISTS jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,7 +53,6 @@ class Database:
             )
         ''')
         
-        # Users table
         c.execute('''
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
@@ -81,7 +71,6 @@ class Database:
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
             
-            # Create unique hash
             hash_str = f"{job['title']}{job.get('organization', '')}"
             job_hash = hashlib.md5(hash_str.encode()).hexdigest()
             
@@ -128,52 +117,127 @@ class Database:
 
 db = Database()
 
-# ==================== JOB FETCHER ====================
-async def fetch_rss_jobs(url, source_name):
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=30) as response:
+# ==================== SCRAPER ====================
+class JobScraper:
+    def __init__(self):
+        self.session = None
+        self.sources = {
+            'employment_news': 'https://employmentnews.gov.in/rss-feed',
+            'ssc': 'https://ssc.nic.in/rss-feed',
+            'upsc': 'https://upsc.gov.in/rss-feed',
+            'tnpsc': 'https://tnpsc.gov.in/rss-feed',
+            'uppsc': 'https://uppsc.up.nic.in/rss'
+        }
+    
+    async def init_session(self):
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        self.session = aiohttp.ClientSession(headers=headers)
+        logger.info("Session initialized")
+    
+    async def close_session(self):
+        if self.session:
+            await self.session.close()
+            logger.info("Session closed")
+    
+    async def fetch_rss(self, url, source_name):
+        try:
+            logger.info(f"Fetching {source_name}...")
+            async with self.session.get(url, timeout=30) as response:
+                if response.status != 200:
+                    logger.error(f"{source_name}: HTTP {response.status}")
+                    return []
+                
                 content = await response.text()
                 feed = feedparser.parse(content)
+                
                 jobs = []
+                for entry in feed.entries[:5]:
+                    job = self._parse_entry(entry, source_name)
+                    if job:
+                        jobs.append(job)
                 
-                for entry in feed.entries:
-                    title = entry.get('title', '')
-                    summary = entry.get('summary', '')
-                    
-                    # Extract organization from title
-                    org = 'Government of India'
-                    for o in ['SSC', 'UPSC', 'RRB', 'IBPS', 'NVS', 'ESIC', 'BECIL', 'SAIL']:
-                        if o in title.upper():
-                            org = o
-                            break
-                    
-                    # Extract last date
-                    last_date = 'Check notification'
-                    import re
-                    date_match = re.search(r'(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})', summary)
-                    if date_match:
-                        last_date = date_match.group(1)
-                    
-                    job = {
-                        'source': source_name,
-                        'title': title,
-                        'organization': org,
-                        'qualification': 'As per notification',
-                        'last_date': last_date,
-                        'apply_link': entry.get('link', ''),
-                        'notification_link': entry.get('link', ''),
-                        'post_date': entry.get('published', ''),
-                        'location': 'All India'
-                    }
-                    jobs.append(job)
-                
+                logger.info(f"{source_name}: Found {len(jobs)} jobs")
                 return jobs
-    except Exception as e:
-        logger.error(f"Error fetching {source_name}: {e}")
-        return []
+                
+        except Exception as e:
+            logger.error(f"{source_name} error: {str(e)}")
+            return []
+    
+    def _parse_entry(self, entry, source):
+        title = entry.get('title', '').strip()
+        summary = entry.get('summary', '').strip()
+        link = entry.get('link', '').strip()
+        
+        if not title:
+            return None
+        
+        return {
+            'source': source,
+            'title': title,
+            'organization': self._extract_org(title),
+            'qualification': self._extract_qualification(summary),
+            'last_date': self._extract_date(summary) or self._extract_date(title),
+            'apply_link': link,
+            'notification_link': link,
+            'post_date': entry.get('published', str(datetime.now())),
+            'location': 'All India'
+        }
+    
+    def _extract_org(self, title):
+        orgs = ['SSC', 'UPSC', 'RRB', 'IBPS', 'NVS', 'ESIC', 'BECIL', 'SAIL', 'UPPSC', 'TNPSC', 'BPSC', 'MPPSC']
+        for org in orgs:
+            if org in title.upper():
+                return org
+        return 'Government of India'
+    
+    def _extract_date(self, text):
+        if not text:
+            return 'Check notification'
+        patterns = [
+            r'Last Date[:\s]+(\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4})',
+            r'(\d{1,2}[-/\.]\d{1,2}[-/\.]\d{4})'
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                return match.group(1)
+        return 'Check notification'
+    
+    def _extract_qualification(self, text):
+        if not text:
+            return 'As per notification'
+        text_upper = text.upper()
+        if '10TH' in text_upper:
+            return '10th Pass'
+        elif '12TH' in text_upper:
+            return '12th Pass'
+        elif 'GRADUATE' in text_upper or 'DEGREE' in text_upper:
+            return 'Graduate'
+        return 'As per notification'
+    
+    async def fetch_all_jobs(self):
+        logger.info("=" * 50)
+        logger.info("STARTING JOB FETCH")
+        logger.info("=" * 50)
+        
+        await self.init_session()
+        all_jobs = []
+        
+        for name, url in self.sources.items():
+            jobs = await self.fetch_rss(url, name)
+            all_jobs.extend(jobs)
+            await asyncio.sleep(1)
+        
+        await self.close_session()
+        
+        logger.info(f"TOTAL JOBS FOUND: {len(all_jobs)}")
+        logger.info("=" * 50)
+        
+        return all_jobs
 
-# ==================== MESSAGE FORMATTER ====================
+# ==================== FORMATTER ====================
 def format_job(job):
     return f"""
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -194,7 +258,7 @@ B. 🎓 ELIGIBILITY CRITERIA
 • Nationality: Indian Citizen
 
 C. 💰 APPLICATION DETAILS
-• Application Fee: As per category (General/OBC/SC/ST)
+• Application Fee: As per category
 • Payment Mode: Online/Offline
 
 D. 📋 SELECTION PROCESS
@@ -243,7 +307,6 @@ def get_buttons(job):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
-    # Check channel membership
     try:
         member = await context.bot.get_chat_member(CHANNEL_ID, user.id)
         if member.status not in ['member', 'administrator', 'creator']:
@@ -252,13 +315,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [[InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{CHANNEL_USERNAME[1:]}")],
                    [InlineKeyboardButton("✅ Verify", callback_data="verify")]]
         await update.message.reply_text(
-            "⚠️ *Please join our channel first to use this bot!*",
+            "⚠️ *Please join our channel first!*",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
         return
     
-    # Save user
     conn = sqlite3.connect('jobs.db')
     c = conn.cursor()
     c.execute('INSERT OR REPLACE INTO users (user_id, username, first_name, is_verified, joined_at) VALUES (?, ?, ?, 1, ?)',
@@ -271,11 +333,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 ✅ You are verified!
 
-🚀 Use /latest to see recent jobs
-🔍 Use /search [keyword] to find jobs
-❓ Use /help for all commands
+🚀 /latest - Recent jobs
+🔍 /search [keyword] - Find jobs
+📢 Channel: {CHANNEL_USERNAME}
 
-Stay updated with genuine government jobs!
+Stay updated!
 """, parse_mode='Markdown')
 
 async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -288,14 +350,13 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if member.status in ['member', 'administrator', 'creator']:
             await query.edit_message_text("✅ *Verified!* Use /latest to see jobs", parse_mode='Markdown')
         else:
-            await query.edit_message_text("❌ *Not joined yet!* Join the channel first.", parse_mode='Markdown')
-    except Exception as e:
-        await query.edit_message_text("❌ Error verifying. Try again.")
+            await query.edit_message_text("❌ *Not joined yet!* Join first.", parse_mode='Markdown')
+    except:
+        await query.edit_message_text("❌ Error. Try again.")
 
 async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     
-    # Verify membership
     try:
         member = await context.bot.get_chat_member(CHANNEL_ID, user.id)
         if member.status not in ['member', 'administrator', 'creator']:
@@ -324,7 +385,7 @@ async def latest(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Usage: /search SSC\nUsage: /search Railway")
+        await update.message.reply_text("Usage: /search SSC\nExample: /search Railway")
         return
     
     keyword = ' '.join(context.args).upper()
@@ -342,42 +403,28 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for job in jobs:
         await update.message.reply_text(format_job(job), parse_mode='Markdown')
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("""
-🤖 *Commands List*
-
-/start - Start bot & verify
-/latest - Latest 5 jobs
-/search [keyword] - Search jobs
-/help - This message
-
-📢 Channel: @Roboallbotchannel
-""", parse_mode='Markdown')
-
-# ==================== SCHEDULED TASKS ====================
-async def fetch_and_post(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("Fetching new jobs...")
+async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin only: Manual job fetch"""
+    user = update.effective_user
     
-    all_jobs = []
+    if user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Admin only!")
+        return
     
-    # Fetch from all sources
-    for name, url in SOURCES.items():
-        jobs = await fetch_rss_jobs(url, name)
-        all_jobs.extend(jobs)
-        await asyncio.sleep(1)  # Be polite
+    await update.message.reply_text("🔄 Fetching jobs... Please wait.")
     
-    # Add to database
+    scraper = JobScraper()
+    jobs = await scraper.fetch_all_jobs()
+    
     new_count = 0
-    for job in all_jobs:
+    for job in jobs:
         if db.add_job(job):
             new_count += 1
     
-    logger.info(f"Added {new_count} new jobs")
-    
-    # Post to channel
+    # Post to channel if new jobs
     if new_count > 0:
-        jobs = db.get_unposted_jobs(3)
-        for job in jobs:
+        unposted = db.get_unposted_jobs(3)
+        for job in unposted:
             try:
                 await context.bot.send_message(
                     chat_id=CHANNEL_ID,
@@ -390,6 +437,60 @@ async def fetch_and_post(context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(2)
             except Exception as e:
                 logger.error(f"Post error: {e}")
+    
+    await update.message.reply_text(
+        f"✅ Done!\n"
+        f"📊 Found: {len(jobs)} jobs\n"
+        f"🆕 New: {new_count} jobs\n"
+        f"📢 Posted to channel: {min(new_count, 3)}"
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("""
+🤖 *Commands*
+
+/start - Start & verify
+/latest - Latest 5 jobs
+/search [keyword] - Search jobs
+/update - Admin: Fetch jobs now
+/help - This message
+
+📢 Channel: @Roboallbotchannel
+""", parse_mode='Markdown')
+
+# ==================== AUTO FETCH ====================
+async def auto_fetch_and_post(context: ContextTypes.DEFAULT_TYPE):
+    """Automatic job fetch every 3 hours"""
+    logger.info("AUTO FETCH STARTED")
+    
+    scraper = JobScraper()
+    jobs = await scraper.fetch_all_jobs()
+    
+    new_count = 0
+    for job in jobs:
+        if db.add_job(job):
+            new_count += 1
+    
+    logger.info(f"New jobs added: {new_count}")
+    
+    if new_count > 0:
+        unposted = db.get_unposted_jobs(3)
+        for job in unposted:
+            try:
+                await context.bot.send_message(
+                    chat_id=CHANNEL_ID,
+                    text=format_job(job),
+                    reply_markup=get_buttons(job),
+                    parse_mode='Markdown',
+                    disable_web_page_preview=True
+                )
+                db.mark_posted(job['id'])
+                logger.info(f"Posted: {job['title'][:30]}...")
+                await asyncio.sleep(2)
+            except Exception as e:
+                logger.error(f"Post error: {e}")
+    
+    logger.info("AUTO FETCH COMPLETED")
 
 # ==================== MAIN ====================
 def main():
@@ -399,12 +500,13 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("latest", latest))
     application.add_handler(CommandHandler("search", search))
+    application.add_handler(CommandHandler("update", update_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(verify_callback, pattern="^verify$"))
     
     # Scheduled job every 3 hours
     job_queue = application.job_queue
-    job_queue.run_repeating(fetch_and_post, interval=timedelta(hours=3), first=10)
+    job_queue.run_repeating(auto_fetch_and_post, interval=timedelta(hours=3), first=10)
     
     logger.info("Bot started!")
     application.run_polling()
